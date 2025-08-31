@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Deriv Digit Analyzer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="bg-gray-900 text-white min-h-screen flex flex-col items-center p-6">
+
+  <h1 class="text-3xl font-bold mb-4">📊 Deriv Live Digit Analyzer</h1>
+
+  <div class="mb-4 flex flex-col gap-2">
+    <input id="token" type="password" placeholder="Paste your API Token"
+      class="p-2 rounded text-black w-80"/>
+    <button id="connectBtn" class="px-4 py-2 bg-green-600 rounded hover:bg-green-700">Connect & Start</button>
+    <button id="stopBtn" class="px-4 py-2 bg-red-600 rounded hover:bg-red-700">Stop</button>
+  </div>
+
+  <div class="mb-4">
+    <label class="mr-2">Volatility symbol</label>
+    <select id="symbol" class="p-2 rounded text-black w-80">
+      <option>Loading...</option>
+    </select>
+  </div>
+
+  <div class="mb-4">
+    <label>Recency window</label>
+    <select id="window" class="p-2 rounded text-black">
+      <option value="50">Last 50</option>
+      <option value="100">Last 100</option>
+      <option value="500">Last 500</option>
+    </select>
+  </div>
+
+  <div id="connStatus" class="mb-4 text-yellow-400">Not connected</div>
+
+  <canvas id="digitChart" width="600" height="300"></canvas>
+  <div class="mt-4 text-lg font-bold">Most frequent digit: <span id="mostFreq">-</span></div>
+  <div class="mt-2 text-lg font-bold">Least frequent digit: <span id="leastFreq">-</span></div>
+  <div class="mt-2 text-lg font-bold">Even %: <span id="evenPct">-</span> | Odd %: <span id="oddPct">-</span></div>
+
+  <script>
+    const tokenEl = document.getElementById('token');
+    const connectBtn = document.getElementById('connectBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const symbolEl = document.getElementById('symbol');
+    const windowEl = document.getElementById('window');
+    const connStatus = document.getElementById('connStatus');
+    const mostFreqEl = document.getElementById('mostFreq');
+    const leastFreqEl = document.getElementById('leastFreq');
+    const evenPctEl = document.getElementById('evenPct');
+    const oddPctEl = document.getElementById('oddPct');
+
+    let ws = null;
+    let digits = [];
+    let chart = null;
+
+    const allSymbols = [
+      {value:'R_10', label:'Volatility 10 Index'},
+      {value:'R_25', label:'Volatility 25 Index'},
+      {value:'R_50', label:'Volatility 50 Index'},
+      {value:'R_75', label:'Volatility 75 Index'},
+      {value:'R_100', label:'Volatility 100 Index'},
+      {value:'R_10_1s', label:'Volatility 10 (1s) Index'},
+      {value:'R_25_1s', label:'Volatility 25 (1s) Index'},
+      {value:'R_50_1s', label:'Volatility 50 (1s) Index'},
+      {value:'R_75_1s', label:'Volatility 75 (1s) Index'},
+      {value:'R_100_1s', label:'Volatility 100 (1s) Index'}
+    ];
+
+    // Populate dropdown
+    symbolEl.innerHTML = '';
+    allSymbols.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.value;
+      opt.textContent = s.label;
+      symbolEl.appendChild(opt);
+    });
+
+    function setupChart() {
+      const ctx = document.getElementById('digitChart').getContext('2d');
+      chart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: Array.from({length: 10}, (_, i) => i.toString()),
+          datasets: [{
+            label: 'Digit Frequency',
+            data: Array(10).fill(0),
+            backgroundColor: 'rgba(0, 200, 255, 0.6)'
+          }]
+        },
+        options: {
+          responsive: true,
+          scales: { y: { beginAtZero: true } }
+        }
+      });
+    }
+
+    function updateStats() {
+      const counts = Array(10).fill(0);
+      digits.forEach(d => counts[d]++);
+      chart.data.datasets[0].data = counts;
+      chart.update();
+
+      let maxDigit = counts.indexOf(Math.max(...counts));
+      let minDigit = counts.indexOf(Math.min(...counts));
+      mostFreqEl.textContent = maxDigit;
+      leastFreqEl.textContent = minDigit;
+
+      const evenCount = counts[0] + counts[2] + counts[4] + counts[6] + counts[8];
+      const oddCount = counts[1] + counts[3] + counts[5] + counts[7] + counts[9];
+      const total = evenCount + oddCount || 1;
+      evenPctEl.textContent = ((evenCount/total)*100).toFixed(1) + '%';
+      oddPctEl.textContent = ((oddCount/total)*100).toFixed(1) + '%';
+    }
+
+    function addDigit(digit) {
+      const winSize = parseInt(windowEl.value, 10);
+      digits.push(digit);
+      if (digits.length > winSize) digits.shift();
+      updateStats();
+    }
+
+    connectBtn.onclick = () => {
+      if (ws) ws.close();
+      ws = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
+      ws.onopen = () => {
+        connStatus.textContent = 'Connected, authorizing...';
+        ws.send(JSON.stringify({ authorize: tokenEl.value.trim() }));
+      };
+      ws.onmessage = e => {
+        const msg = JSON.parse(e.data);
+        if (msg.error) {
+          connStatus.textContent = 'Error: ' + msg.error.message;
+          return;
+        }
+        if (msg.authorize) {
+          connStatus.textContent = 'Authorized. Subscribing...';
+          ws.send(JSON.stringify({ ticks: symbolEl.value, subscribe: 1 }));
+        }
+        if (msg.tick) {
+          const lastDigit = parseInt(msg.tick.quote.toString().slice(-1), 10);
+          addDigit(lastDigit);
+        }
+      };
+    };
+
+    stopBtn.onclick = () => {
+      if (ws) {
+        ws.close();
+        ws = null;
+        connStatus.textContent = 'Stopped';
+      }
+    };
+
+    setupChart();
+  </script>
+</body>
+</html>
