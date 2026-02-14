@@ -1,0 +1,569 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2639
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;\f1\fnil\fcharset0 AppleColorEmoji;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx566\tx1133\tx1700\tx2267\tx2834\tx3401\tx3968\tx4535\tx5102\tx5669\tx6236\tx6803\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 const express = require("express");\
+const http = require("http");\
+const \{ Server \} = require("socket.io");\
+const WebSocket = require("ws");\
+\
+const PORT = 3000;\
+const DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089";\
+const DERIV_TOKEN = "YOUR_DERIV_TOKEN_HERE"; // PUT YOUR TOKEN HERE\
+\
+const app = express();\
+const server = http.createServer(app);\
+const io = new Server(server);\
+\
+app.use(express.json());\
+\
+let deriv;\
+let authorized = false;\
+\
+const state = \{\
+  ticks: [],\
+\};\
+\
+const auto = \{\
+  running: false,\
+\
+  market: "R_50",\
+\
+  stake: 1,\
+  maxStake: 10,\
+\
+  minConfidence: 75,\
+\
+  maxLossStreak: 3,\
+  lossStreak: 0,\
+\
+  sessionMaxLoss: 50,\
+  sessionLoss: 0,\
+\
+  sessionProfitTarget: 30,\
+  sessionProfit: 0,\
+\
+  maxTradesPerHour: 30,\
+  tradesThisHour: 0,\
+  lastHourReset: Date.now(),\
+\
+  cooldownUntil: 0,\
+\
+  loop: null,\
+\};\
+\
+// ---------------------\
+// CONNECT DERIV\
+// ---------------------\
+\
+function connectDeriv() \{\
+  deriv = new WebSocket(DERIV_WS_URL);\
+\
+  deriv.on("open", () => \{\
+    console.log("
+\f1 \uc0\u9989 
+\f0  Deriv WebSocket opened. Authorizing...");\
+    deriv.send(JSON.stringify(\{ authorize: DERIV_TOKEN \}));\
+  \});\
+\
+  deriv.on("message", (msg) => \{\
+    const data = JSON.parse(msg);\
+\
+    if (data.error) \{\
+      console.error("
+\f1 \uc0\u10060 
+\f0  Deriv Error:", data.error.message);\
+      return;\
+    \}\
+\
+    if (data.msg_type === "authorize") \{\
+      authorized = true;\
+      console.log("
+\f1 \uc0\u9989 
+\f0  Deriv Authorized:", data.authorize.loginid);\
+      subscribeTicks();\
+    \}\
+\
+    if (data.msg_type === "tick") \{\
+      handleTick(data.tick);\
+    \}\
+\
+    if (data.msg_type === "proposal_open_contract") \{\
+      handleContractUpdate(data.proposal_open_contract);\
+    \}\
+\
+    if (data.msg_type === "buy") \{\
+      handleBuyResponse(data.buy);\
+    \}\
+  \});\
+\
+  deriv.on("close", () => \{\
+    authorized = false;\
+    auto.running = false;\
+    console.log("
+\f1 \uc0\u9888 \u65039 
+\f0  Deriv WebSocket closed. Reconnecting in 3 seconds...");\
+    setTimeout(connectDeriv, 3000);\
+  \});\
+\
+  deriv.on("error", (err) => \{\
+    console.error("
+\f1 \uc0\u10060 
+\f0  WebSocket Error:", err.message);\
+  \});\
+\}\
+\
+function subscribeTicks() \{\
+  if (!authorized) return;\
+\
+  deriv.send(\
+    JSON.stringify(\{\
+      ticks: auto.market,\
+      subscribe: 1,\
+    \})\
+  );\
+\
+  console.log("
+\f1 \uc0\u55357 \u56545 
+\f0  Subscribed to ticks:", auto.market);\
+\}\
+\
+// ---------------------\
+// HANDLE TICKS\
+// ---------------------\
+\
+function handleTick(tick) \{\
+  const price = tick.quote.toString();\
+  const digit = parseInt(price.slice(-1));\
+\
+  state.ticks.unshift(\{\
+    epoch: tick.epoch,\
+    price,\
+    digit,\
+  \});\
+\
+  if (state.ticks.length > 500) state.ticks.pop();\
+\
+  io.emit("tick", \{ price, digit \});\
+\}\
+\
+// ---------------------\
+// MILLI DIGIT STRATEGY\
+// ---------------------\
+\
+function milliPrediction() \{\
+  if (state.ticks.length < 80) return null;\
+\
+  const recent = state.ticks.slice(0, 80);\
+\
+  const count = Array(10).fill(0);\
+  recent.forEach((t) => count[t.digit]++);\
+\
+  let bestDigit = 0;\
+  let high = 0;\
+\
+  let leastDigit = 0;\
+  let low = Infinity;\
+\
+  for (let d = 0; d < 10; d++) \{\
+    if (count[d] > high) \{\
+      high = count[d];\
+      bestDigit = d;\
+    \}\
+    if (count[d] < low) \{\
+      low = count[d];\
+      leastDigit = d;\
+    \}\
+  \}\
+\
+  const confidenceRaw = (high / recent.length) * 100;\
+  const biasStrength = high - low;\
+\
+  // CHOPPY FILTER (Milli concept)\
+  if (confidenceRaw < 18) return null;\
+  if (biasStrength < 6) return null;\
+\
+  const direction = bestDigit >= 5 ? "under" : "over";\
+\
+  // Convert into 0-100 confidence style\
+  const confidence = Math.min(100, confidenceRaw * 5);\
+\
+  return \{\
+    digit: bestDigit,\
+    direction,\
+    confidence,\
+    biasStrength,\
+    count,\
+  \};\
+\}\
+\
+// ---------------------\
+// STAKE SYSTEM (MILLI STYLE)\
+// ---------------------\
+\
+function getStake() \{\
+  let stake = auto.stake;\
+\
+  if (auto.lossStreak === 1) stake = auto.stake * 1.3;\
+  if (auto.lossStreak === 2) stake = auto.stake * 1.7;\
+  if (auto.lossStreak === 3) stake = auto.stake * 2.2;\
+\
+  if (stake > auto.maxStake) stake = auto.maxStake;\
+\
+  return stake;\
+\}\
+\
+// ---------------------\
+// PLACE DIGIT TRADE\
+// ---------------------\
+\
+function placeDigitTrade(digit, direction, stake) \{\
+  return new Promise((resolve, reject) => \{\
+    if (!authorized) return reject(new Error("Not authorized"));\
+\
+    const contract_type = direction === "over" ? "DIGITOVER" : "DIGITUNDER";\
+\
+    deriv.send(\
+      JSON.stringify(\{\
+        buy: 1,\
+        price: stake,\
+        parameters: \{\
+          amount: stake,\
+          basis: "stake",\
+          contract_type,\
+          currency: "USD",\
+          duration: 1,\
+          duration_unit: "t",\
+          symbol: auto.market,\
+          barrier: digit,\
+        \},\
+      \})\
+    );\
+\
+    const listener = (msg) => \{\
+      const data = JSON.parse(msg);\
+\
+      if (data.msg_type === "buy") \{\
+        deriv.removeListener("message", listener);\
+\
+        if (data.error) return reject(data.error);\
+\
+        resolve(data.buy);\
+      \}\
+    \};\
+\
+    deriv.on("message", listener);\
+  \});\
+\}\
+\
+// ---------------------\
+// AFTER BUY RESPONSE\
+// ---------------------\
+\
+function handleBuyResponse(buy) \{\
+  if (!buy || !buy.contract_id) return;\
+\
+  console.log("
+\f1 \uc0\u55357 \u56524 
+\f0  Bought contract:", buy.contract_id);\
+\
+  // Subscribe to this contract ONLY (correct Deriv method)\
+  deriv.send(\
+    JSON.stringify(\{\
+      proposal_open_contract: 1,\
+      contract_id: buy.contract_id,\
+      subscribe: 1,\
+    \})\
+  );\
+\
+  io.emit("tradePlaced", \{\
+    contract_id: buy.contract_id,\
+    buy_price: buy.buy_price,\
+  \});\
+\}\
+\
+// ---------------------\
+// CONTRACT UPDATE HANDLER\
+// ---------------------\
+\
+function handleContractUpdate(contract) \{\
+  if (!contract || !contract.is_sold) return;\
+\
+  const profit = parseFloat(contract.profit);\
+  const stake = parseFloat(contract.buy_price);\
+\
+  const win = profit > 0;\
+\
+  if (win) \{\
+    auto.lossStreak = 0;\
+    auto.sessionProfit += profit;\
+  \} else \{\
+    auto.lossStreak++;\
+    auto.sessionLoss += stake;\
+    auto.sessionProfit += profit;\
+\
+    // Milli cooldown after 2 losses\
+    if (auto.lossStreak >= 2) \{\
+      auto.cooldownUntil = Date.now() + 30000; // 30 seconds cooldown\
+      io.emit("autoLog", "
+\f1 \uc0\u9888 \u65039 
+\f0  2 losses detected. Cooling down 30 seconds...");\
+    \}\
+  \}\
+\
+  io.emit("tradeResult", \{\
+    contract_id: contract.contract_id,\
+    result: win ? "WIN" : "LOSS",\
+    profit: profit.toFixed(2),\
+    totalProfit: auto.sessionProfit.toFixed(2),\
+    lossStreak: auto.lossStreak,\
+  \});\
+\
+  console.log(\
+    `
+\f1 \uc0\u9989 
+\f0  Contract settled: $\{win ? "WIN" : "LOSS"\} Profit: $\{profit\} Total: $\{\
+      auto.sessionProfit\
+    \}`\
+  );\
+\
+  // STOP CONDITIONS (Milli risk management)\
+  if (auto.sessionLoss >= auto.sessionMaxLoss) return stopAuto("Session loss limit reached");\
+  if (auto.lossStreak >= auto.maxLossStreak) return stopAuto("Loss streak limit reached");\
+  if (auto.sessionProfit >= auto.sessionProfitTarget) return stopAuto("Profit target reached");\
+\}\
+\
+// ---------------------\
+// AUTO LOOP\
+// ---------------------\
+\
+function startAuto() \{\
+  if (auto.running) return;\
+\
+  auto.running = true;\
+  auto.lossStreak = 0;\
+  auto.sessionLoss = 0;\
+  auto.sessionProfit = 0;\
+  auto.tradesThisHour = 0;\
+  auto.lastHourReset = Date.now();\
+  auto.cooldownUntil = 0;\
+\
+  io.emit("autoStatus", \{ running: true \});\
+\
+  auto.loop = setInterval(async () => \{\
+    try \{\
+      if (!auto.running) return;\
+\
+      // Hour reset\
+      if (Date.now() - auto.lastHourReset > 3600000) \{\
+        auto.tradesThisHour = 0;\
+        auto.lastHourReset = Date.now();\
+      \}\
+\
+      // Cooldown check\
+      if (Date.now() < auto.cooldownUntil) return;\
+\
+      // Safety checks\
+      if (auto.tradesThisHour >= auto.maxTradesPerHour) return stopAuto("Max trades/hour reached");\
+      if (auto.sessionLoss >= auto.sessionMaxLoss) return stopAuto("Session loss limit reached");\
+      if (auto.lossStreak >= auto.maxLossStreak) return stopAuto("Loss streak limit reached");\
+\
+      // Prediction\
+      const p = milliPrediction();\
+      if (!p) return;\
+\
+      if (p.confidence < auto.minConfidence) return;\
+\
+      const stake = getStake();\
+\
+      io.emit(\
+        "autoLog",\
+        `
+\f1 \uc0\u55357 \u56524 
+\f0  Setup: Digit $\{p.digit\} ($\{p.direction\}) Confidence $\{p.confidence.toFixed(\
+          2\
+        )\}% BiasStrength $\{p.biasStrength\}`\
+      );\
+\
+      const contract = await placeDigitTrade(p.digit, p.direction, stake);\
+\
+      auto.tradesThisHour++;\
+\
+      io.emit(\
+        "autoLog",\
+        `
+\f1 \uc0\u55357 \u56960 
+\f0  Trade placed: Digit $\{p.digit\} $\{p.direction\} Stake $$\{stake.toFixed(2)\}`\
+      );\
+    \} catch (err) \{\
+      console.error("AUTO ERROR:", err.message || err);\
+      stopAuto("Bot error");\
+    \}\
+  \}, 1500);\
+\}\
+\
+function stopAuto(reason) \{\
+  if (auto.loop) clearInterval(auto.loop);\
+  auto.running = false;\
+  io.emit("autoStatus", \{ running: false, reason \});\
+\
+  console.log("
+\f1 \uc0\u55357 \u57041 
+\f0  Bot stopped:", reason);\
+\}\
+\
+// ---------------------\
+// API ROUTES\
+// ---------------------\
+\
+app.post("/api/auto/start", (req, res) => \{\
+  Object.assign(auto, req.body || \{\});\
+  startAuto();\
+  res.json(\{ ok: true, message: "Auto started" \});\
+\});\
+\
+app.post("/api/auto/stop", (req, res) => \{\
+  stopAuto("Stopped by user");\
+  res.json(\{ ok: true, message: "Auto stopped" \});\
+\});\
+\
+app.get("/api/status", (req, res) => \{\
+  res.json(\{\
+    authorized,\
+    running: auto.running,\
+    stake: auto.stake,\
+    maxStake: auto.maxStake,\
+    minConfidence: auto.minConfidence,\
+    lossStreak: auto.lossStreak,\
+    sessionLoss: auto.sessionLoss,\
+    sessionProfit: auto.sessionProfit,\
+    profitTarget: auto.sessionProfitTarget,\
+    tradesThisHour: auto.tradesThisHour,\
+    cooldown: Math.max(0, auto.cooldownUntil - Date.now()),\
+  \});\
+\});\
+\
+// ---------------------\
+// FRONTEND CONTROL PANEL\
+// ---------------------\
+\
+app.get("/", (req, res) => \{\
+  res.send(`\
+  <html>\
+  <head>\
+    <title>nick_fx Milli X Trade Bot</title>\
+    <style>\
+      body \{ background:#0b0f1a; color:white; font-family:Arial; padding:20px; \}\
+      input \{ padding:8px; margin:5px; border-radius:10px; border:none; \}\
+      button \{ padding:10px 15px; margin:5px; border-radius:10px; border:none; cursor:pointer; \}\
+      #startAuto \{ background:#00ffc8; font-weight:bold; \}\
+      #stopAuto \{ background:#ff2d55; color:white; font-weight:bold; \}\
+      .box \{ background:#121a2a; padding:15px; border-radius:15px; margin-top:10px; \}\
+    </style>\
+  </head>\
+  <body>\
+    <h2>
+\f1 \uc0\u55358 \u56598 
+\f0  nick_fx Milli X Trade Bot (Deriv)</h2>\
+\
+    <div class="box">\
+      <h3>Settings</h3>\
+      Stake: <input id="stake" type="number" value="1"><br>\
+      Max Stake: <input id="maxStake" type="number" value="10"><br>\
+      Min Confidence: <input id="minConf" type="number" value="75"><br>\
+      Max Loss Streak: <input id="maxLoss" type="number" value="3"><br>\
+      Session Max Loss: <input id="maxSessLoss" type="number" value="50"><br>\
+      Profit Target: <input id="profitTarget" type="number" value="30"><br><br>\
+\
+      <button id="startAuto">START BOT</button>\
+      <button id="stopAuto">STOP BOT</button>\
+    </div>\
+\
+    <div class="box">\
+      <h3>Status</h3>\
+      <div id="autoStatus">Status: stopped</div>\
+      <div id="tickLog">Tick: -</div>\
+    </div>\
+\
+    <div class="box">\
+      <h3>Bot Logs</h3>\
+      <div id="autoLog"></div>\
+    </div>\
+\
+    <div class="box">\
+      <h3>Trade Result</h3>\
+      <div id="tradeResult"></div>\
+    </div>\
+\
+    <script src="/socket.io/socket.io.js"></script>\
+    <script>\
+      const socket = io();\
+\
+      const autoStatusDiv = document.getElementById("autoStatus");\
+      const autoLogDiv = document.getElementById("autoLog");\
+      const tickLogDiv = document.getElementById("tickLog");\
+      const tradeResultDiv = document.getElementById("tradeResult");\
+\
+      socket.on("autoStatus", (data) => \{\
+        autoStatusDiv.textContent =\
+          "Status: " + (data.running ? "running" : "stopped") +\
+          (data.reason ? " (" + data.reason + ")" : "");\
+      \});\
+\
+      socket.on("autoLog", (msg) => \{\
+        autoLogDiv.innerHTML = msg + "<br>" + autoLogDiv.innerHTML;\
+      \});\
+\
+      socket.on("tick", (data) => \{\
+        tickLogDiv.textContent = "Tick: " + data.price + " (Digit: " + data.digit + ")";\
+      \});\
+\
+      socket.on("tradeResult", (data) => \{\
+        tradeResultDiv.innerHTML =\
+          "Result: " + data.result +\
+          " | Profit: $" + data.profit +\
+          " | Total Profit: $" + data.totalProfit +\
+          " | Loss Streak: " + data.lossStreak +\
+          "<br>" + tradeResultDiv.innerHTML;\
+      \});\
+\
+      document.getElementById("startAuto").onclick = async () => \{\
+        const cfg = \{\
+          stake: Number(document.getElementById("stake").value),\
+          maxStake: Number(document.getElementById("maxStake").value),\
+          minConfidence: Number(document.getElementById("minConf").value),\
+          maxLossStreak: Number(document.getElementById("maxLoss").value),\
+          sessionMaxLoss: Number(document.getElementById("maxSessLoss").value),\
+          sessionProfitTarget: Number(document.getElementById("profitTarget").value)\
+        \};\
+\
+        await fetch("/api/auto/start", \{\
+          method: "POST",\
+          headers: \{"Content-Type":"application/json"\},\
+          body: JSON.stringify(cfg)\
+        \});\
+      \};\
+\
+      document.getElementById("stopAuto").onclick = async () => \{\
+        await fetch("/api/auto/stop", \{ method:"POST" \});\
+      \};\
+    </script>\
+  </body>\
+  </html>\
+  `);\
+\});\
+\
+// ---------------------\
+// START SERVER\
+// ---------------------\
+\
+server.listen(PORT, () => \{\
+  console.log(`
+\f1 \uc0\u55357 \u56960 
+\f0  Server running at http://localhost:$\{PORT\}`);\
+  connectDeriv();\
+\});\
+}
